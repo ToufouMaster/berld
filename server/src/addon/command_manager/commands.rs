@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 use protocol::nalgebra::Point3;
+use crate::addon::command_manager::commands::dungeon::FloorMap;
+use crate::server::creature::Creature;
 
 mod xp;
 mod warp;
@@ -12,6 +15,7 @@ mod kick;
 mod player;
 mod tp;
 mod test;
+mod dungeon;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Default)]
 pub struct Who;
@@ -44,3 +48,8 @@ pub struct Tp;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Default)]
 pub struct Test;
+
+#[derive(Default)]
+pub struct Dungeon {
+	rooms_map: RwLock<Vec<FloorMap>>,
+}

@@ -16,15 +16,16 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
-use protocol::{Packet, WriteCwData};
-use protocol::nalgebra::{Point2, Point3};
+use protocol::{nalgebra, Packet, WriteCwData};
+use protocol::nalgebra::{Point2, Point3, Vector2, Vector3};
 use protocol::packet::{*, Hit};
 use protocol::packet::common::{CreatureId, Item};
-use protocol::packet::creature_update::Affiliation;
+use protocol::packet::creature_update::{Affiliation, Animation};
+use protocol::packet::hit::Kind;
 use protocol::packet::world_update::drops::Drop;
 use protocol::packet::world_update::Sound;
 use protocol::packet::world_update::sound::Kind::*;
-use protocol::utils::constants::SIZE_ZONE;
+use protocol::utils::constants::{SIZE_BLOCK, SIZE_ZONE};
 use protocol::utils::io_extensions::{ReadPacket, WriteArbitrary, WritePacket};
 
 use crate::addon::{Addons, enable_pvp, freeze_time};
@@ -41,9 +42,10 @@ pub mod utils;
 
 #[derive(Default)]
 pub struct Server {
-	id_pool: RwLock<CreatureIdPool>,
+	pub id_pool: RwLock<CreatureIdPool>,
 	pub players: RwLock<Vec<Arc<Player>>>,
 	drops: RwLock<HashMap<Point2<i32>, Vec<Drop>>>,
+	pub creatures: RwLock<HashMap<CreatureId, Creature>>,
 	pub addons: Addons
 }
 
@@ -56,10 +58,73 @@ impl Server {
 		self.addons.discord_integration.run(&self);
 		freeze_time(&self);
 
+		let self_static: &'static Server = unsafe { transmute(&self) };//todo: scoped task
+
+		tokio::spawn(async move {
+			loop {
+				let mut creatures_guard = self_static.creatures.write().await;
+				for (id, _) in creatures_guard.clone().into_iter() {
+					let id = CreatureId(id.0 as i64);
+					let Some(creature) = creatures_guard.get_mut(&id) else {continue};
+					let players_guard = self_static.players.read().await;
+					if players_guard.len() == 0 {continue}
+					let Some(player) = players_guard.get(0) else {continue};
+					let character = player.character.read().await;
+
+					creature.animation_time += 50;
+					let speed = 50_000.0;
+					creature.position = Point3::new(
+						creature.position[0] + creature.velocity[0] as i64,
+						creature.position[1] + creature.velocity[1] as i64,
+						creature.position[2]
+					);
+					let distance: nalgebra::Vector2<f64> = nalgebra::Vector2::new((character.position[0] - creature.position[0]) as f64, (character.position[1] - creature.position[1]) as f64);
+					let direction: nalgebra::Vector2<f64> = distance.normalize();
+					if (distance[0] > (SIZE_BLOCK*2) as f64) || (distance[0] < (-SIZE_BLOCK*2) as f64) || (distance[1] > (SIZE_BLOCK*2) as f64) || (distance[1] < (-SIZE_BLOCK*2) as f64) {
+						creature.velocity = Vector3::new((direction[0]*speed) as f32, (direction[1]*speed) as f32, 0.0);
+						creature.animation = Animation::Idle
+					} else {
+						creature.velocity = Vector3::new(0.0, 0.0, 0.0);
+						if creature.animation == Animation::Idle {
+							creature.animation = Animation::UnusedDualWieldAttack;
+							creature.animation_time = 0;
+							self_static.broadcast(&WorldUpdate {
+								hits: vec![Hit {
+									attacker: id,
+									target: player.id,
+									kind: Kind::Normal,
+									damage: 45.0,
+									position: creature.position,
+									direction: Vector3::new(direction[0] as f32, direction[1] as f32, 0.0),
+									..Default::default()
+								}],
+								..Default::default()
+							}, None).await;
+						}
+					}
+
+					player.send_ignoring(&CreatureUpdate {
+						id,
+						position: Some(creature.position),
+						velocity: Some(creature.velocity),
+						animation: Some(creature.animation),
+						animation_time: Some(creature.animation_time),
+						..Default::default()
+					}).await;
+
+					if creature.animation != Animation::Idle && creature.animation_time > 1000 {
+						creature.animation = Animation::Idle;
+					}
+
+				}
+
+				sleep(Duration::from_millis(50)).await;
+			}
+		});
+
+
 		loop {
 			let (stream, address) = listener.accept().await.unwrap();
-
-			let self_static: &'static Self = unsafe { transmute(&self) }; //todo: scoped task
 			tokio::spawn(async move {
 				#[expect(clippy::redundant_pattern_matching, reason="TODO")]
 				if let Err(_) = self_static.handle_new_connection(stream, address).await {

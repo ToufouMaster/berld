@@ -19,6 +19,68 @@ impl HandlePacket<Hit> for Server {
 	async fn handle_packet(&self, source: &Player, mut packet: Hit) {
 		let players_guard = self.players.read().await;
 		let Some(target) = players_guard.iter().find(|player| { player.id == packet.target }) else {
+
+			let creatures_guard_read = self.creatures.read().await;
+			let Some((id, target)) = &creatures_guard_read.clone().into_iter().find(|(id, creature)| { *id == packet.target }) else {
+				return; //can happen when the target disconnected in this moment
+			};
+			drop(creatures_guard_read);
+			let source_character_guard = source.character.read().await;
+			let mut creatures_guard = self.creatures.write().await;
+			let Some(mut target_writable) = creatures_guard.get_mut(id) else {return};
+
+			balancing::adjust_hit(&mut packet, &source_character_guard, &target);
+			packet.flash = true;//todo: (re-)move
+
+
+			source.send_ignoring(&CreatureUpdate { // Avoid the depletion of the target blocking gauge
+				id: *id,
+				blocking_gauge: Some(target.blocking_gauge),
+				..Default::default()
+			}).await;
+
+			let mut hits_vec = vec![];
+			let mut hit_sounds = impact_sounds(&packet, target.race);
+
+			if packet.kind == Block {
+				let block_packet = Hit { // Show Block message when attack is Blocked
+					kind: Block,
+					damage: 0.0,
+					critical: true, // text is clearer like this
+					..packet
+				};
+				hits_vec.push(block_packet); // To target
+
+				let left_weapon = &target.equipment[Slot::LeftWeapon];
+				let right_weapon = &target.equipment[Slot::RightWeapon];
+				if left_weapon.kind != Weapon(Shield) && right_weapon.kind != Weapon(Shield) { // No shield blocking
+					packet.damage /= 4.0;
+					packet.kind = Normal;
+					hits_vec.push(packet); // Normal hit packet, but with damage divided by 4
+				}
+			} else {
+				hits_vec.push(packet);
+			}
+
+			let mut next_health = target.health;
+			for hit in &hits_vec {
+				next_health -= hit.damage;
+			}
+
+			source.send_ignoring(&CreatureUpdate { // Avoid the depletion of the target blocking gauge
+				id: *id,
+				health: Some(next_health),
+				..Default::default()
+			}).await;
+			target_writable.health = next_health;
+			println!("{}", target_writable.health);
+
+			if next_health <= 0.0 {
+				self.broadcast(&WorldUpdate { // send death sound to all players
+					sounds: vec![Sound::at(target.position, Destroy2)],
+					..Default::default()
+				}, None).await;
+			}
 			return; //can happen when the target disconnected in this moment
 		};
 		let target_character_guard = target.character.read().await;
